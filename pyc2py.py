@@ -406,11 +406,13 @@ class BinarySubscr(Expression):
 
 class FunctionCall(Expression):
   """ Function call expression : expr(expr1, expr2, param = expr3) """
-  def __init__(self, expr, pos_args = [], key_args = {}):
+  def __init__(self, expr, pos_args = [], key_args = {}, var_args = None, kwvar_args = None):
     Expression.__init__(self)
     self.function = expr
     self.pos_args = pos_args
     self.key_args = key_args
+    self.var_args = var_args
+    self.kwvar_args = kwvar_args
     # rare case where generator does not need parenthesises
     if len(self.key_args) == 0 and len(self.pos_args) == 1 and isinstance(self.pos_args[0], Generator):
       self.pos_args[0].parenthesize = False
@@ -424,6 +426,14 @@ class FunctionCall(Expression):
       keys = self.key_args.keys()
       keys.sort()
       args += ", ".join([key + " = " + self.key_args[key].write() for key in keys])
+    if self.var_args:
+      if len(args) > 0:
+        args += ", "
+      args += '*' + self.var_args.write()
+    if self.kwvar_args:
+      if len(args) > 0:
+        args += ", "
+      args += '**' + self.kwvar_args.write()
     return self.function.write() + "(" + args + ")"
 
 class Slice(Expression):
@@ -1855,11 +1865,19 @@ class PythonDecompiler:
         else:
           raise PythonDecompilerError("Invalid argument for BUILD_SLICE.", addr, opname, arg)
         stack.append(Slice(start, stop, step))
-      elif opname == 'CALL_FUNCTION':
+      elif opname[:13] == 'CALL_FUNCTION':
         nkey_params = (arg >> 8) & 0xff;
         npos_params = arg & 0xff;
         keywords = {}
         positional_params = []
+        var_args = kwvar_args = None
+        if opname[13:] == '_VAR':
+          var_args = stack.pop()
+        elif opname[13:] == '_KW':
+          kwvar_args = stack.pop()
+        elif opname[13:] == '_VAR_KW':
+          kwvar_args = stack.pop()
+          var_args = stack.pop()
         for i in range(0, nkey_params):
           key_value = stack.pop()
           key_name = stack.pop()
@@ -1884,7 +1902,7 @@ class PythonDecompiler:
             stack.append(positional_params[0])
             statements.append(Decorator(func))
           else:
-            stack.append(FunctionCall(func, positional_params, keywords))
+            stack.append(FunctionCall(func, positional_params, keywords, var_args, kwvar_args))
       elif opname == 'COMPARE_OP':
         right = stack.pop()
         left = stack.pop()
@@ -2288,6 +2306,6 @@ if __name__ == "__main__":
       print(pydec.disassemble())
     else:
       print(pydec.decompile(indent = indent_pattern))
-  except Exception as e:
+  except PythonDecompilerError as e:
     print("Error: " + str(e))
 
