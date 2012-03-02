@@ -537,6 +537,8 @@ class DocString(Statement):
 
   @Statement.auto_indent
   def write(self, indent):
+    print self.comment
+    print self.indent_level
     lines = self.comment.split("\n")
     indented_lines = [ self.make_indent(indent) + line.lstrip() for line in lines[1:] ]
     return '"""' + "\n".join(lines[0:1] + indented_lines) + '"""'
@@ -570,6 +572,11 @@ class ClassDefinition(Block):
     if method.name[0:1] == '_' and method.name[1:len(self.name)+1] == self.name:
       method.name = method.name[len(self.name)+1:]
 
+  def set_indent_level(self, level):
+    Block.set_indent_level(self, level)
+    if self.docstring:
+      self.docstring.set_indent_level(level + 1)
+
   @Statement.auto_indent
   def write(self, indent):
     out = "class " + self.name
@@ -600,6 +607,11 @@ class FunctionDefinition(Block):
   def set_docstring(self, string):
     self.docstring = DocString(string)
     self.docstring.set_indent_level(self.indent_level + 1)
+
+  def set_indent_level(self, level):
+    Block.set_indent_level(self, level)
+    if self.docstring:
+      self.docstring.set_indent_level(level + 1)
 
   @Statement.auto_indent
   def write(self, indent):
