@@ -537,8 +537,6 @@ class DocString(Statement):
 
   @Statement.auto_indent
   def write(self, indent):
-    print self.comment
-    print self.indent_level
     lines = self.comment.split("\n")
     indented_lines = [ self.make_indent(indent) + line.lstrip() for line in lines[1:] ]
     return '"""' + "\n".join(lines[0:1] + indented_lines) + '"""'
@@ -675,11 +673,19 @@ class ImportFrom(Statement):
 class Assert(Statement):
   """ Assert statement.
   Equivalent to 
-    if not expr: raise AssertionError(expr2)
+    if not expr: raise AssertionError(message)
   """
-  def __init__(self, expr):
+  def __init__(self, expr, message = None):
     Statement.__init__(self)
     self.expr = expr
+    self.message = message
+
+  @Statement.auto_indent
+  def write(self, indent = ''):
+    out = "assert " + self.expr.write()
+    if self.message:
+      out += ", " + self.message.write()
+    return out
 
 class Print(Statement):
   """ Print statement. """
@@ -1529,6 +1535,17 @@ class PythonDecompiler:
       if_stmt.expr = UnaryOp('not ', if_stmt.expr)
       if_stmt.statements = else_stmt.statements
       else_stmt.statements = []
+
+    # Detect assert statements
+    if len(else_stmt.statements) == 0 and len(if_stmt.statements) == 1:
+      if isinstance(if_stmt.statements[0], Raise) and if_stmt.statements[0].exception == Variable('AssertionError'):
+        if isinstance(if_stmt.expr, UnaryOp) and if_stmt.expr.op == 'not ':
+          assert_stmt = Assert(if_stmt.expr.expr)
+        else:
+          assert_stmt = Assert(if_stmt.expr)
+        assert_stmt.message = if_stmt.statements[0].param
+        return (end_addr, [ assert_stmt ])
+
     stmts = [ if_stmt ]
     if len(else_stmt.statements) > 0:
       else_stmts = []
