@@ -37,13 +37,24 @@ class Statement:
 
   def __eq__(self, s):
     if isinstance(s, Statement):
-      my_level = self.indent_level
-      s_level = s.indent_level
+      saved_indent_levels = self.indent_level, s.indent_level
       self.set_indent_level(0)
       s.set_indent_level(0)
+      if hasattr(self, 'parenthesize'):
+        saved_self_parenthesize = self.parenthesize
+        self.parenthesize = True
+      if hasattr(s, 'parenthesize'):
+        saved_other_parenthesize = s.parenthesize  
+        s.parenthesize = True
+
       equals = self.write(' ') == s.write(' ')
-      self.set_indent_level(my_level)
-      s.set_indent_level(s_level)
+
+      self.set_indent_level(saved_indent_levels[0])
+      s.set_indent_level(saved_indent_levels[1])
+      if hasattr(self, 'parenthesize'):
+        self.parenthesize = saved_self_parenthesize
+      if hasattr(s, 'parenthesize'):
+        self.parenthesize = saved_other_parenthesize
       return equals
     else:
       return False
@@ -335,20 +346,40 @@ class BinaryOp(Expression):
     self.left = left
     self.right = right
     self.parenthesize = False
-    if isinstance(self.left, BinaryOp) or isinstance(self.left, UnaryOp):
-      if self.left.precedence() < self.precedence():
+    logical_ops = ( 'and', 'or' )
+    if self.op in logical_ops:
+      neg_op = logical_ops[1-logical_ops.index(self.op)]
+      if isinstance(self.left, BinaryOp) and self.left.op == neg_op:
         self.left.parenthesize = True
-    if isinstance(self.right, BinaryOp) or isinstance(self.right, UnaryOp):
-      if self.precedence() == self.right.precedence() and not self.commutative():
+      if isinstance(self.right, BinaryOp) and self.right.op == neg_op:
         self.right.parenthesize = True
-      elif self.right.precedence() < self.precedence():
-        self.right.parenthesize = True
+    else:
+      if isinstance(self.left, BinaryOp) or isinstance(self.left, UnaryOp):
+        if self.left.precedence() < self.precedence():
+          self.left.parenthesize = True
+      if isinstance(self.right, BinaryOp) or isinstance(self.right, UnaryOp):
+        if self.precedence() == self.right.precedence() and not self.commutative():
+          self.right.parenthesize = True
+        elif self.right.precedence() < self.precedence():
+          self.right.parenthesize = True
   
   def commutative(self):
     return self.op in PythonDecompiler.commutative_operators
 
   def precedence(self):
     return PythonDecompiler.binary_operator_precedences[self.op]
+
+  def first(self):
+    if isinstance(self.left, BinaryOp):
+      return self.left.first
+    else:
+      return self.left
+
+  def last(self):
+    if isinstance(self.right, BinaryOp):
+      return self.right.last
+    else:
+      return self.right
 
   @Statement.auto_indent
   def write(self, indent = ''):
@@ -697,7 +728,6 @@ class ImportFrom(Statement):
       out += " as " + self.as_name.write()
     return out
 
-# TODO
 class Assert(Statement):
   """ Assert statement.
   Equivalent to 
@@ -1077,8 +1107,8 @@ class PythonDecompilerError(Exception):
 
   def __str__(self):
     info = "Decompilation error: %s" % self.message
-    if addr and opname:
-      info += "[address: %d, instruction: %s" % (self.addr, self.opname)
+    if self.addr and self.opname:
+      info += " [address: %d, instruction: %s" % (self.addr, self.opname)
     if self.arg:
       info += " (%s)" % repr(self.arg)
     info += "]"
@@ -1124,6 +1154,7 @@ class PythonDecompiler:
   }
 
   commutative_operators = ( '+', '*', '&', '^', '|', '!=', '==', '<>' )
+  comparison_operators = ( '<', '<=', '==', '!=', '<>', '>=', '>' )
 
   unary_operator_precedences = {
     'not ' : 3,
@@ -1264,10 +1295,9 @@ class PythonDecompiler:
     """ Decompile a code object.
     Return a list of Statements.
     """
-    if len(code.co_consts) > 0:
-      print code.co_consts[0]
-    dis.dis(code)
-    print '_' * 80
+    if __debug__:
+      dis.dis(code)
+      print '_' * 80
     insns = self.__disassemble(code)
     return self.__decompile_block(insns, [])[1]
 
@@ -1348,9 +1378,7 @@ class PythonDecompiler:
                 blocks[arg] = PythonBasicBlock(arg)
                 blocks[arg].end_addr = arg
               block.add_child(blocks[arg])
-              addr_list = ( arg, addr + opsize, )
-            else:
-              addr_list = ( arg, addr + opsize )
+            addr_list = ( arg, addr + opsize )
           else: # unconditional jump
             if arg < start_addr: # outer loop iteration, probably a continue statement
               if not arg in blocks:
@@ -1408,7 +1436,7 @@ class PythonDecompiler:
     return self.__find_convergent_block(src_blocks, children, walked)
 
   def __reduce_conditional_blocks(self, stmts):
-    """ Factorize and reduce conditional blocks """
+    """ Reduce conditional blocks """
     repass = True
     while repass:
       repass = False
@@ -1436,39 +1464,57 @@ class PythonDecompiler:
         # z                         |   z
         if isinstance(stmts[i], If) or isinstance(stmts[i], Elif):
           if len(stmts[i].statements) > 0 and isinstance(stmts[i].statements[0], If):
-            if len(stmts[i].statements) > 0 and stmts[i].statements[1:] == stmts[i+1:]: 
-              stmts[i].expr = BinaryOp(stmts[i].expr, 'and', stmts[i].statements[0].expr) 
-              stmts[i].statements = stmts[i].statements[0].statements
-              repass = True
-            elif i < len(stmts) - 1 and isinstance(stmts[i+1], Else):
+            if i < len(stmts) - 1 and isinstance(stmts[i+1], Else):
               if stmts[i].statements[0].statements == stmts[i+1].statements:
                 stmts[i].expr = BinaryOp(UnaryOp('not ', stmts[i].expr), 'or', stmts[i].statements[0].expr)
                 stmts[i].statements = stmts.pop(i+1).statements
                 repass = True
+                continue
+            if stmts[i].statements[1:] == stmts[1-len(stmts[i].statements):] or stmts[i].statements[1:] == stmts[i+1:] or len(stmts[i].statements) == 1: 
+              stmts[i].expr = BinaryOp(stmts[i].expr, 'and', stmts[i].statements[0].expr) 
+              stmts[i].statements = stmts[i].statements[0].statements
+              repass = True
+              continue
         i = i + 1
 
     return stmts
 
   def __factorize_condition(self, expr):
-    """ Factorize a conditional expression """
+    """ Factorize a logical expression """
     ops = ( 'and', 'or' )
     if isinstance(expr, BinaryOp) and expr.op in ops:
       neg_op = ops[1-ops.index(expr.op)]
       expr.left = self.__factorize_condition(expr.left)
       expr.right = self.__factorize_condition(expr.right)
+      #
+      # (x < y) and (y < z) = x < y < z
+      #
+      #if expr.op == 'and' and isinstance(expr.left, BinaryOp) and isinstance(expr.right, BinaryOp) and expr.right.op in self.comparison_operators and expr.left.op in self.comparison_operators and expr.left.last == expr.right.first:
+      #  expr = BinaryOp(expr.left, expr.right.op, expr.right.right)
+      #  expr.left.parenthesize = expr.parenthesize = False
+      
+      #
       # (x and y) or (z and y) = (x or z) and y
+      #
       if isinstance(expr.left, BinaryOp) and isinstance(expr.right, BinaryOp) and expr.right.op == expr.left.op == neg_op and expr.left.right == expr.right.right:
         expr = BinaryOp(BinaryOp(expr.left.left, expr.op, expr.right.left), neg_op, expr.right.right)
+      #
       # (x and (y or z)) or z = (x and y) or z
+      #
       if isinstance(expr.left, BinaryOp) and expr.left.op == neg_op and isinstance(expr.left.right, BinaryOp) and expr.left.right.op == expr.op and expr.left.right.right == expr.right:
         expr = BinaryOp(BinaryOp(expr.left.left, neg_op, expr.left.right.left), expr.op, expr.right)
 
     if isinstance(expr, UnaryOp) and expr.op == 'not ':
       expr.expr = self.__factorize_condition(expr.expr)
+      #
       # not (not x) = x
+      #
       if isinstance(expr.expr, UnaryOp) and expr.expr.op == 'not ':
         expr = expr.expr.expr
+      #
       # not ((not x) and (not y)) = x or y
+      # not ((not x) or (not y)) = x and y
+      #
       if isinstance(expr.expr, BinaryOp) and expr.expr.op in ops:
         if isinstance(expr.expr.left, UnaryOp) and isinstance(expr.expr.right, UnaryOp):
           if expr.expr.left.op == expr.expr.right.op == 'not ':
@@ -1478,16 +1524,16 @@ class PythonDecompiler:
   def __detect_end_of_statement(self, insns):
     """ Find the next address after a conditional statement """
     blocks = {}
-    #print 'creating except basic blocks at ' + str(insns[0][0])
+    #print 'creating basic blocks at ' + str(insns[0][0])
     first_block = self.__create_basic_blocks(self.__first_addr(insns), insns, blocks)
-    #print 'except src_blocks : ',
+    #print 'src_blocks : ',
     #print [ b.addr for b in first_block.children]
 
     if len(first_block.children) == 1:
       end_block = None
     else:
       end_block = self.__find_convergent_block(first_block.children, first_block.children, set())
-    #print 'except result : ',
+    #print 'result : ',
     #if end_block:
     #  print end_block.addr
     #else:
@@ -1570,18 +1616,18 @@ class PythonDecompiler:
         logical_expr = True
         # if x: x else y => x or y
         if if_stmt.expr == if_stack[-1]:
-          if_stack[-1] = BinaryOp(if_stack[-1], "or", else_stack[-1])
+          if_stack[-1] = self.__factorize_condition(BinaryOp(if_stack[-1], "or", else_stack[-1]))
         # if x: y else x => x and y
         elif if_stmt.expr == else_stack[-1]:
-          if_stack[-1] = BinaryOp(else_stack[-1], "and", if_stack[-1])
+          if_stack[-1] = self.__factorize_condition(BinaryOp(else_stack[-1], "and", if_stack[-1]))
         # if x: z else (y and z) => (x or y) and z
         elif isinstance(else_stack[-1], BinaryOp) and else_stack[-1].op == 'and' and if_stack[-1] == else_stack[-1].right:
-          if_stack[-1] = BinaryOp(BinaryOp(if_stmt.expr, 'or', else_stack[-1].left), 'and', if_stack[-1])
+          if_stack[-1] = self.__factorize_condition(BinaryOp(BinaryOp(if_stmt.expr, 'or', else_stack[-1].left), 'and', if_stack[-1]))
         # if x: (y or z) else: z => (x and y) or z
         elif isinstance(if_stack[-1], BinaryOp) and if_stack[-1].op == 'or' and else_stack[-1] == if_stack[-1].right:
-          if_stack[-1] = BinaryOp(BinaryOp(if_stmt.expr, 'and', if_stack[-1].left), 'or', else_stack[-1])
+          if_stack[-1] = self.__factorize_condition(BinaryOp(BinaryOp(if_stmt.expr, 'and', if_stack[-1].left), 'or', else_stack[-1]))
         else: # generic conditional expression
-          if_stack[-1] = ConditionalExpression(if_stack[-1], if_stmt.expr, else_stack[-1]) 
+          if_stack[-1] = ConditionalExpression(if_stack[-1], self.__factorize_condition(if_stmt.expr), else_stack[-1]) 
         #i = i - 1
     stack[:] = if_stack
     if logical_expr:
@@ -1609,7 +1655,9 @@ class PythonDecompiler:
       else:
         else_stmts.append(else_stmt)
       stmts.extend(else_stmts)
+    # reduction of statements
     stmts = self.__reduce_conditional_blocks(stmts)
+    # reduction of expression
     for s in stmts:
       if isinstance(s, If) or isinstance(s, Elif):
         s.expr = self.__factorize_condition(s.expr)
@@ -1841,7 +1889,6 @@ class PythonDecompiler:
         right = stack.pop()
         left = stack.pop()
         stack.append(BinaryOp(left, arg, right))
-        # XXX: exception match operator => except block
       elif opname == 'CONTINUE_LOOP':
         statements.append(Continue())
         return ( arg, statements )
@@ -2002,6 +2049,7 @@ class PythonDecompiler:
       elif opname == 'POP_TOP':
         value = stack.pop()
         if isinstance(value, FunctionCall) or isinstance(value, Yield):
+        #if isinstance(value, Expression) and not isinstance(value, Variable) and not isinstance(value, Constant):
           statements.append(value)
       elif opname == 'PRINT_ITEM':
         if len(statements) > 0 and isinstance(statements[-1], Print) and not statements[-1].new_line:
@@ -2234,13 +2282,12 @@ if __name__ == "__main__":
     exit(1)
 
   target = args[0]
-  #try:
-  pydec = PythonDecompiler(target)
-  if disassemble:
-    print(pydec.disassemble())
-  else:
-    print(pydec.decompile(indent = indent_pattern))
-
-  #except Exception as e:
-  #  print("Error: " + repr(e))
+  try:
+    pydec = PythonDecompiler(target)
+    if disassemble:
+      print(pydec.disassemble())
+    else:
+      print(pydec.decompile(indent = indent_pattern))
+  except Exception as e:
+    print("Error: " + str(e))
 
