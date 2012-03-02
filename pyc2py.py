@@ -106,7 +106,7 @@ class Block(Statement):
   def write(self, indent = ''):
     self.replace_statements(
       match = lambda s: isinstance(s, If) and len(s.statements) == 1 and isinstance(s.statements[0], Raise) and s.statements[0].exception == Variable('AssertionError'),
-      new = lambda s: Assert(s.expr if isinstance(s.expr, UnaryOp) and s.expr.op == 'not ' else UnaryOp('not ', s.expr), s.statements[0].param)
+      new = lambda s: Assert(s.expr.expr if isinstance(s.expr, UnaryOp) and s.expr.op == 'not ' else UnaryOp('not ', s.expr), s.statements[0].param)
     )
     if len(self.statements) == 0:
       self.append_statement(Pass())
