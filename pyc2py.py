@@ -86,9 +86,10 @@ class Block(Statement):
   def replace_statements(self, match, new, rec = False):
     for i, statement in enumerate(self.statements):
       if rec and isinstance(statement, Block):
-        statement.replace_statements(match, create)
+        statement.replace_statements(match, new, rec)
       if match(statement):
         self.statements[i] = new(statement)
+        self.statements[i].set_indent_level(self.indent_level + 1)
 
   def delete_statements(self, match, rec = False):
     pos = []
@@ -103,6 +104,10 @@ class Block(Statement):
       self.append_statement(Pass())
 
   def write(self, indent = ''):
+    self.replace_statements(
+      match = lambda s: isinstance(s, If) and len(s.statements) == 1 and isinstance(s.statements[0], Raise) and s.statements[0].exception == Variable('AssertionError'),
+      new = lambda s: Assert(s.expr if isinstance(s.expr, UnaryOp) and s.expr.op == 'not ' else UnaryOp('not ', s.expr), s.statements[0].param)
+    )
     if len(self.statements) == 0:
       self.append_statement(Pass())
     return "\n".join([statement.write(indent) for statement in self.statements])
@@ -246,7 +251,7 @@ class ListComprehension(Expression):
 
   @Statement.auto_indent
   def write(self, indent = ''):
-    return '[' + comp.write() + ']'
+    return '[' + self.comp.write() + ']'
 
 class SetComprehension(Expression):
   """ Set comprehension : {expr1 for vars in expr2} """
@@ -256,17 +261,24 @@ class SetComprehension(Expression):
 
   @Statement.auto_indent
   def write(self, indent = ''):
-    return '{' + comp.write() + '}'
+    return '{' + self.comp.write() + '}'
 
 class Generator(Expression):
   """ Generator expression : (expr1 for vars in expr2) """
   def __init__(self, comp):
     Expression.__init__(self)
     self.comp = comp
+    self.parenthesize = True
 
   @Statement.auto_indent
   def write(self, indent = ''):
-    return '(' + self.comp.write() + ')'
+    out = ''
+    if self.parenthesize:
+      out += '('
+    out += self.comp.write()
+    if self.parenthesize:
+      out += ')'
+    return out
 
 class UnaryOp(Expression):
   """ Expression with unary operator (e.g ~expr) """
@@ -355,6 +367,9 @@ class FunctionCall(Expression):
     self.function = expr
     self.pos_args = pos_args
     self.key_args = key_args
+    # rare case where generator does not need parenthesises
+    if len(self.key_args) == 0 and len(self.pos_args) == 1 and isinstance(self.pos_args[0], Generator):
+      self.pos_args[0].parenthesize = False
 
   @Statement.auto_indent
   def write(self, indent = ''):
@@ -840,9 +855,6 @@ class PythonProgram(Block):
       rec = False
     )
 
-  def write(self, indent = "    "):
-    return "\n".join([ statement.write(indent) for statement in self.statements ])
-
 class PythonExceptionClass:
   """
   Internally used by the decompiler to represent the current exception class.
@@ -917,6 +929,14 @@ class PythonIterate:
   """
   def __init__(self, iterator):
     self.iterator = iterator
+
+class PythonOpenedComprehension(Statement):
+  """
+  Fake statement. Internally used by the decompiler for reconstructing comprehensions.
+  """
+  def __init__(self, comp):
+    self.init = comp
+    self.current = comp.comp # Comprehension component in type comprehension
 
 class PythonBlockFinalizer(Block):
   """
@@ -1384,16 +1404,22 @@ class PythonDecompiler:
 
       i = 0
       while i < len(stmts):
-        # if x:         if x and y:
-        #   if y:   =>    foo
-        #     foo       z
-        #   [z]
-        # z
-        if len(stmts[i].statements) > 0 and isinstance(stmts[i].statements[0], If):
-          if len(stmts[i].statements) == 1 or stmts[i].statements[1:] == stmts[1-len(stmts[i].statements):]: 
-            stmts[i].expr = BinaryOp(stmts[i].expr, 'and', stmts[i].statements[0].expr) 
-            stmts[i].statements = stmts[i].statements[0].statements
-            repass = True
+        # if x:         if x and y: | if x:         if not x or y:
+        #   if y:   =>    foo       |   if y:   =>    z
+        #     foo       z           |     z 
+        #   [z]                     | else:
+        # z                         |   z
+        if isinstance(stmts[i], If) or isinstance(stmts[i], Elif):
+          if len(stmts[i].statements) > 0 and isinstance(stmts[i].statements[0], If):
+            if len(stmts[i].statements) > 0 and stmts[i].statements[1:] == stmts[i+1:]: 
+              stmts[i].expr = BinaryOp(stmts[i].expr, 'and', stmts[i].statements[0].expr) 
+              stmts[i].statements = stmts[i].statements[0].statements
+              repass = True
+            elif i < len(stmts) - 1 and isinstance(stmts[i+1], Else):
+              if stmts[i].statements[0].statements == stmts[i+1].statements:
+                stmts[i].expr = BinaryOp(UnaryOp('not ', stmts[i].expr), 'or', stmts[i].statements[0].expr)
+                stmts[i].statements = stmts.pop(i+1).statements
+                repass = True
         i = i + 1
 
     return stmts
@@ -1536,16 +1562,6 @@ class PythonDecompiler:
       if_stmt.statements = else_stmt.statements
       else_stmt.statements = []
 
-    # Detect assert statements
-    if len(else_stmt.statements) == 0 and len(if_stmt.statements) == 1:
-      if isinstance(if_stmt.statements[0], Raise) and if_stmt.statements[0].exception == Variable('AssertionError'):
-        if isinstance(if_stmt.expr, UnaryOp) and if_stmt.expr.op == 'not ':
-          assert_stmt = Assert(if_stmt.expr.expr)
-        else:
-          assert_stmt = Assert(if_stmt.expr)
-        assert_stmt.message = if_stmt.statements[0].param
-        return (end_addr, [ assert_stmt ])
-
     stmts = [ if_stmt ]
     if len(else_stmt.statements) > 0:
       else_stmts = []
@@ -1561,6 +1577,7 @@ class PythonDecompiler:
     for s in stmts:
       if isinstance(s, If) or isinstance(s, Elif):
         s.expr = self.__factorize_condition(s.expr)
+    
     return (end_addr, stmts)
 
   def __decompile_try_catch(self, insns, stack):
@@ -1823,7 +1840,35 @@ class PythonDecompiler:
           iterator.exhausted_addr = arg
           stack.append(PythonIterate(iterator))
         else:
-          stack.pop() # remove the iterator from the stack
+          iterator = stack.pop() # remove the iterator from the stack
+          if_expr = None
+          if len(statements) > 0 and isinstance(statements[-1], If):
+            if len(statements[-1].statements) > 0 and isinstance(statements[-1].statements[0], PythonOpenedComprehension):
+              comp = statements[-1].statements[0].current # get comprehension
+              if_expr = statements[-1].expr
+              statements[-1] = statements[-1].statements[0] # destroy If
+          if len(statements) > 1 and isinstance(statements[-1], PythonOpenedComprehension):
+            comp = statements[-1].current 
+            if isinstance(statements[-2], Assignment):
+              assign = statements[-2]
+              if isinstance(assign.right, PythonIterate) and assign.right.iterator == iterator:
+                iterable = iterator.expr
+                if isinstance(assign.left, ExpressionList):
+                  var = assign.left.exprs
+                else:
+                  var = [ assign.left ]
+                if comp.variables:
+                  comp.expr = Comprehension(comp.expr, var, iterable)
+                  statements[-1].current = comp.expr
+                else:
+                  comp.variables = var
+                  comp.iterable = iterable
+                if if_expr:
+                  statements[-1].current.if_expr = if_expr
+                statements.pop(-2) # remove assign
+                if len(stack) > 0 and stack[-1] is statements[-1].init:
+                  statements.pop() # no more iteration, remove opened comprehension
+
           n = self.__jmp_to_insn_at(insns, iterator.exhausted_addr)
       elif opname == 'GET_ITER':
         stack.append(PythonIterator(stack.pop()))
@@ -1855,32 +1900,9 @@ class PythonDecompiler:
           jmp_n = self.__jmp_to_insn_at(insns, arg)
           n = jmp_n
       elif opname == 'LIST_APPEND':
-        assign = statements.pop()
         expr = stack.pop()
-        if not isinstance(assign, Assignment) or not isinstance(assign.right, PythonIterate) or not assign.right.iterator in stack[-arg:]:
-          raise PythonDecompilerError(
-            "List comprehension error: cannot locate variable or iterator.",
-            addr, opname, arg
-          )
-        if isinstance(assign.left, ExpressionList):
-          var = assign.left.exprs
-        else:
-          var = [ assign.left ]
-        iterable = assign.right.iterator.expr
-        comprehension = Comprehension(expr, var, iterable)
-        # detect chained comprehensions
-        prev_comprehension = comprehension
-        while len(statements) > 0 and isinstance(statements[-1], Assignment) and isinstance(statements[-1].right, PythonIterate) and statements[-1].right.iterator in stack[-arg:]:
-          assign = statements.pop()
-          if isinstance(assign.left, ExpressionList):
-            var = assign.left.exprs
-          else:
-            var = [ assign.left ]
-          iterable = assign.right.iterator.expr
-          new_comprehension = Comprehension(prev_comprehension.expr, var, iterable)
-          prev_comprehension.expr = new_comprehension 
-          prev_comprehension = new_comprehension
-        stack[-arg] = (Constant([ comprehension ]))
+        stack[-arg] = ListComprehension(Comprehension(expr, None, None))
+        statements.append(PythonOpenedComprehension(stack[-arg]))
       elif opname == 'LOAD_ATTR':
         stack.append(GetAttr(stack.pop(), arg))
       elif opname == 'LOAD_CONST':
@@ -1977,6 +1999,10 @@ class PythonDecompiler:
       elif opname == 'ROT_TWO':
         tos = stack.pop(); tos1 = stack.pop()
         stack.append(tos); stack.append(tos1)
+      elif opname == 'SET_ADD':
+        expr = stack.pop()
+        stack[-arg] = SetComprehension(Comprehension(expr, None, None))
+        statements.append(PythonOpenedComprehension(stack[-arg]))
       elif opname in ('SETUP_EXCEPT', 'SETUP_FINALLY'):
         next_addr, try_stmts = self.__decompile_try_catch(insns[n-1:], stack)
         statements.extend(try_stmts)
