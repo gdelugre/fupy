@@ -19,8 +19,8 @@
   Contact: Guillaume Delugre <guillaume (at) security-labs (dot) org>
 """
 
-import os, sys
-import imp, dis, opcode, marshal, struct
+import sys
+import imp, dis, opcode, marshal
 import types
 import __builtin__
 
@@ -243,22 +243,35 @@ class Comprehension(Expression):
       out += " if " + self.if_expr.write()
     return out
 
-class ListComprehension(Expression):
-  """ List comprehension : [expr1 for vars in expr2] """
+class TypedComprehension(Expression):
+  """ List/set/dict comprehensions """
   def __init__(self, comp):
     Expression.__init__(self)
     self.comp = comp
 
+class ListComprehension(TypedComprehension):
+  """ List comprehension : [expr1 for vars in expr2] """
   @Statement.auto_indent
   def write(self, indent = ''):
     return '[' + self.comp.write() + ']'
 
-class SetComprehension(Expression):
+class SetComprehension(TypedComprehension):
   """ Set comprehension : {expr1 for vars in expr2} """
-  def __init__(self, comp):
-    Expression.__init__(self)
-    self.comp = comp
+  @Statement.auto_indent
+  def write(self, indent = ''):
+    return '{' + self.comp.write() + '}'
 
+class DictComprehensionEntry:
+  """ Entry in dict comprehension : key_expr : value_expr """
+  def __init__(self, key_expr, value_expr):
+    self.key_expr = key_expr
+    self.value_expr = value_expr
+
+  def write(self, indent = ''):
+    return self.key_expr.write() + ' : ' + self.value_expr.write()
+
+class DictComprehension(TypedComprehension):
+  """ Dict comprehension : { key_expr : value_expr for vars in expr } """
   @Statement.auto_indent
   def write(self, indent = ''):
     return '{' + self.comp.write() + '}'
@@ -894,7 +907,14 @@ class PythonCompiledFunction:
 
 class PythonCompiledGenerator:
   """
-  Internally used by the decompiled to represent a precompiled generator object.
+  Internally used by the decompiler to represent a precompiled generator object.
+  """
+  def __init__(self, code):
+    self.code = code
+
+class PythonCompiledComprehension:
+  """
+  Internally used by the decompiler to represent set and dict comprehensions.
   """
   def __init__(self, code):
     self.code = code
@@ -1143,8 +1163,13 @@ class PythonDecompiler:
     'SETUP_EXCEPT', # except clause
   )
 
+  CODE_FLAG_OPTIMIZED = 1
+  CODE_FLAG_NEWLOCALS = 2
   CODE_FLAG_VARARGS = 4
   CODE_FLAG_KWVARARGS = 8
+  CODE_FLAG_NESTED = 16
+  CODE_FLAG_GENERATOR = 32
+  CODE_FLAG_NOFREE = 64
 
   WHY_NOT = 1
   WHY_EXCEPT = 2
@@ -1437,6 +1462,17 @@ class PythonDecompiler:
       # (x and (y or z)) or z = (x and y) or z
       if isinstance(expr.left, BinaryOp) and expr.left.op == neg_op and isinstance(expr.left.right, BinaryOp) and expr.left.right.op == expr.op and expr.left.right.right == expr.right:
         expr = BinaryOp(BinaryOp(expr.left.left, neg_op, expr.left.right.left), expr.op, expr.right)
+
+    if isinstance(expr, UnaryOp) and expr.op == 'not ':
+      expr.expr = self.__factorize_condition(expr.expr)
+      # not (not x) = x
+      if isinstance(expr.expr, UnaryOp) and expr.expr.op == 'not ':
+        expr = expr.expr.expr
+      # not ((not x) and (not y)) = x or y
+      if isinstance(expr.expr, BinaryOp) and expr.expr.op in ops:
+        if isinstance(expr.expr.left, UnaryOp) and isinstance(expr.expr.right, UnaryOp):
+          if expr.expr.left.op == expr.expr.right.op == 'not ':
+            expr = BinaryOp(expr.expr.left, ops[1-ops.index(expr.expr.op)], expr.expr.right)
     return expr
 
   def __detect_end_of_statement(self, insns):
@@ -1655,6 +1691,20 @@ class PythonDecompiler:
       stmts.extend(else_stmt.statements)
     return (next_addr, stmts)
 
+  def __decompile_comprehension(self, code, argument):
+    """ Decompile a comprehension implemented as a code object """
+    comp_stmts = self.__decompile(code)
+    if len(comp_stmts) != 1 or not isinstance(comp_stmts[0], Return):
+      if not isinstance(comp_stmts[0].expr, TypedComprehension):
+        raise PythonDecompilerError("Cannot decompile comprehension in code object.")
+    comp = comp_stmts[0].expr
+    iterable = argument.expr
+    nested = comp.comp
+    while isinstance(nested.expr, Comprehension):
+      nested = nested.expr
+    nested.iterable = iterable
+    return comp
+
   def __decompile_generator(self, code, argument):
     """ Decompile an anonymous generator """
     gen_stmts = self.__decompile(code)
@@ -1776,6 +1826,11 @@ class PythonDecompiler:
             raise PythonDecompilerError("Expected iterator argument for generator.", addr, opname, arg)
           generator = self.__decompile_generator(func.code, positional_params[0])
           stack.append(generator)
+        elif isinstance(func, PythonCompiledComprehension):
+          if npos_params != 1 or not isinstance(positional_params[0], PythonIterator):
+            raise PythonDecompilerError("Expected iterator argument for comprehension.", addr, opname, arg)
+          comp = self.__decompile_comprehension(func.code, positional_params[0])
+          stack.append(comp)
         else:
           if arg == 1 and isinstance(positional_params[0], PythonCompiledFunction):
             stack.append(positional_params[0])
@@ -1928,14 +1983,15 @@ class PythonDecompiler:
           stack.append(Lambda(args, default_args, self.__decompile(code)))
         elif code.co_name == '<genexpr>':
           stack.append(PythonCompiledGenerator(code))
-        elif code.co_name == '<setcomp>':
-          dis.dis(code)
-          raise Exception("set comp")
-        elif code.co_name == '<dictcomp>':
-          dis.dis(code)
-          raise Exception("dict comp")
+        elif code.co_name in ('<setcomp>', '<dictcomp>'):
+          stack.append(PythonCompiledComprehension(code))
         else: 
           stack.append(PythonCompiledFunction(code, default_args))
+      elif opname == 'MAP_ADD':
+        key_expr = stack.pop()
+        value_expr = stack.pop()
+        stack[-arg] = DictComprehension(Comprehension(DictComprehensionEntry(key_expr, value_expr), None, None))
+        statements.append(PythonOpenedComprehension(stack[-arg]))
       elif opname == 'NOP':
         pass
       elif opname == 'POP_BLOCK':
