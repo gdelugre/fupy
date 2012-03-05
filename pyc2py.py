@@ -1061,10 +1061,7 @@ class PythonUnpackedSequence:
     self.variables[index] = var
 
   def is_complete(self):
-    for var in self.variables:
-      if var == None:
-        return False
-    return True
+    return all(self.variables)
 
 class PythonUnpackedValue:
   """
@@ -1305,9 +1302,9 @@ class PythonDecompiler:
     """ Decompile a code object.
     Return a list of Statements.
     """
-    if __debug__:
-      dis.dis(code)
-      print '_' * 80
+    #if __debug__:
+    #  dis.dis(code)
+    #  print '_' * 80
     insns = self.__disassemble(code)
     return self.__decompile_block(insns, [])[1]
 
@@ -1817,8 +1814,10 @@ class PythonDecompiler:
         left = stack.pop()
         if opname == 'BINARY_SUBSCR':
           stack.append(BinarySubscr(left, right))
-        else:
+        elif opname[7:] in self.binary_operators:
           stack.append(BinaryOp(left, self.binary_operators[opname[7:]], right))
+        else:
+          raise PythonDecompilerError("Unhandled opcode", addr, opname, arg)
       elif opname == 'BREAK_LOOP':
         statements.append(Break())
       elif opname == 'BUILD_CLASS':
@@ -2160,35 +2159,54 @@ class PythonDecompiler:
         stop_expr = stack.pop()
         start_expr = stack.pop()
         stack.append(BinarySubscr(stack.pop(), Slice(start = start_expr, stop = stop_expr)))
-      elif opname == 'STORE_MAP':
-        map_const = stack[-3]
-        if not isinstance(map_const, Constant) or not isinstance(map_const.value, types.DictType):  
-          raise PythonDecompilerError("Expected dict type.", addr, opname, arg)
-        key = stack.pop()
-        value = stack.pop()
-        map_const.value[key] = value
-      elif opname == 'STORE_SLICE+0':
-        statements.append(Assignment(BinarySubscr(stack.pop(), Slice()), stack.pop()))
-      elif opname == 'STORE_SLICE+1':
-        expr = stack.pop()
-        statements.append(Assignment(BinarySubscr(stack.pop(), Slice(start = expr)), stack.pop()))
-      elif opname == 'STORE_SLICE+2':
-        expr = stack.pop()
-        statements.append(Assignment(BinarySubscr(stack.pop(), Slice(stop = expr)), stack.pop()))
-      elif opname == 'STORE_SLICE+3':
-        stop_expr = stack.pop()
-        start_expr = stack.pop()
-        statements.append(Assignment(BinarySubscr(stack.pop(), Slice(start = start_expr, stop = stop_expr)), stack.pop()))
-      elif opname == 'STORE_ATTR':
-        base = stack.pop()
-        value = stack.pop()
-        statements.append(Assignment(GetAttr(base, arg), value))
-      elif opname == 'STORE_GLOBAL':
-        if arg not in __builtin__.__dict__:
-          self.global_vars.add(Variable(arg))
-        statements.append(Assignment(Variable(arg), stack.pop()))
-      elif opname in ('STORE_NAME', 'STORE_FAST', 'STORE_DEREF'):
-        value = stack.pop()
+      elif opname[:6] == 'STORE_':
+        store_type = opname[6:]
+        if store_type == 'ATTR':
+          base = stack.pop()
+          value = stack.pop()
+          target = GetAttr(base, arg) 
+        elif store_type == 'GLOBAL':
+          value = stack.pop()
+          target = Variable(arg)
+          if arg not in __builtin__.__dict__:
+            self.global_vars.add(target)
+        elif store_type == 'MAP':
+          map_const = stack[-3]
+          if not isinstance(map_const, Constant) or not isinstance(map_const.value, types.DictType):  
+            raise PythonDecompilerError("Expected dict type.", addr, opname, arg)
+          key = stack.pop()
+          value = stack.pop()
+          map_const.value[key] = value
+          continue
+        elif store_type == 'SLICE+0':
+          target = BinarySubscr(stack.pop(), Slice()) 
+          value = stack.pop()
+        elif store_type == 'SLICE+1':
+          start_expr = stack.pop()
+          base = stack.pop()
+          target = BinarySubscr(base, Slice(start = start_expr)) 
+          value = stack.pop()
+        elif store_type == 'SLICE+2':
+          stop_expr = stack.pop()
+          base = stack.pop()
+          target = BinarySubscr(base, Slice(stop = stop_expr)) 
+          value = stack.pop()
+        elif store_type == 'SLICE+3':
+          stop_expr = stack.pop()
+          start_expr = stack.pop()
+          base = stack.pop()
+          value = stack.pop()
+          target =  BinarySubscr(base, Slice(start = start_expr, stop = stop_expr))
+        elif store_type == 'SUBSCR':
+          index = stack.pop()
+          base = stack.pop()
+          value = stack.pop()
+          target =  BinarySubscr(base, index)
+        elif store_type in ('NAME', 'FAST', 'DEREF'): 
+          value = stack.pop()
+          target = Variable(arg)
+        else:
+          raise PythonDecompilerError("Unhandled opcode", addr, opname, arg)
         if isinstance(value, PythonCompiledFunction):
           func = value
           arg_count = func.code.co_argcount
@@ -2210,31 +2228,28 @@ class PythonDecompiler:
           name = arg
           statements.append(ClassDefinition(name, classo.supers, self.__decompile(classo.code)))
         elif isinstance(value, PythonCompiledModule):
-          if Variable(arg) != value.module:
-            statements.append(Import(value.module, as_name = Variable(arg)))
+          if target != value.module:
+            statements.append(Import(value.module, as_name = target))
           else:
             statements.append(Import(value.module))
         elif isinstance(value, PythonCompiledModuleAttr):
-          if Variable(arg) != value.name:
-            statements.append(ImportFrom(value.module, value.name, as_name = Variable(arg)))
+          if target != value.name:
+            statements.append(ImportFrom(value.module, value.name, as_name = target))
           else:
             statements.append(ImportFrom(value.module, value.name))
         elif isinstance(value, PythonUnpackedValue):
-          value.sequence.bind(value.index, Variable(arg))
+          value.sequence.bind(value.index, target)
           if value.sequence.is_complete():
             statements.append(Assignment(ExpressionList(value.sequence.variables), value.sequence.expr))
         else:
-          statements.append(Assignment(Variable(arg), value))
-      elif opname == 'STORE_SUBSCR':
-        right = stack.pop()
-        left = stack.pop()
-        value = stack.pop()
-        statements.append(Assignment(BinarySubscr(left, right), value))
+          statements.append(Assignment(target, value))
       elif opname[:6] == 'UNARY_':
         if opname == 'UNARY_CONVERT':
           stack.append(UnaryConvert(stack.pop()))
-        else:
+        elif opname[6:] in self.unary_operators:
           stack.append(UnaryOp(self.unary_operators[opname[6:]], stack.pop()))
+        else:
+          raise PythonDecompilerError("Unhandled opcode", addr, opname, arg)
       elif opname == 'UNPACK_SEQUENCE':
         sequence = PythonUnpackedSequence(stack.pop(), arg)
         for i in range(0, arg):
