@@ -806,7 +806,7 @@ class Return(Statement):
   """ return statement. """
   def __init__(self, expr = None):
     Statement.__init__(self)
-    if isinstance(expr, Constant) and expr.value == None:
+    if isinstance(expr, Constant) and expr.value is None:
       self.expr = None
     else:
       self.expr = expr
@@ -1023,13 +1023,17 @@ class PythonBasicBlock:
       self.children.remove(block)
       block.parents.remove(self)
 
-  def get_ancestors(self):
+  def get_ancestors(self, walked = None):
+    if walked is None:
+      walked = set()
     if self.ancestors:
       return self.ancestors
     else:
       self.ancestors = set()
       for parent in self.parents:
-        self.ancestors |= parent.get_ancestors()
+        if parent not in walked:
+          walked.add(parent)
+          self.ancestors |= parent.get_ancestors(walked)
       self.ancestors |= self.parents
       return self.ancestors
 
@@ -1181,10 +1185,10 @@ class PythonDecompiler:
     'JUMP_IF_TRUE_OR_POP', 
     'JUMP_IF_FALSE_OR_POP',
     
-    'FOR_ITER', # finally clause
-    'SETUP_FINALLY', # finally clause
-    'SETUP_WITH', # finally clause
-    'SETUP_EXCEPT', # except clause
+    'FOR_ITER',       # finally clause
+    'SETUP_FINALLY',  # finally clause
+    'SETUP_WITH',     # finally clause
+    'SETUP_EXCEPT',   # except clause
   )
 
   jump_insns = ( 
@@ -1195,10 +1199,11 @@ class PythonDecompiler:
     'JUMP_FORWARD',
     'JUMP_ABSOLUTE',
     'CONTINUE_LOOP',
-    'FOR_ITER', # finally clause
-    'SETUP_FINALLY', # finally clause
-    'SETUP_WITH', # finally clause
-    'SETUP_EXCEPT', # except clause
+    # XXX: BREAK_LOOP ??? Need to keep track of loop blocks
+    'FOR_ITER',       # finally clause
+    'SETUP_FINALLY',  # finally clause
+    'SETUP_WITH',     # finally clause
+    'SETUP_EXCEPT',   # except clause
   )
 
   CODE_FLAG_OPTIMIZED = 1
@@ -1302,9 +1307,10 @@ class PythonDecompiler:
     """ Decompile a code object.
     Return a list of Statements.
     """
-    #if __debug__:
-    #  dis.dis(code)
-    #  print '_' * 80
+    if __debug__:
+      print 'Disassembling %s:' % code.co_name
+      dis.dis(code)
+      print '_' * 80
     insns = self.__disassemble(code)
     return self.__decompile_block(insns, [])[1]
 
@@ -1314,6 +1320,9 @@ class PythonDecompiler:
     """
     next_addr, statements = self.__decompile_block(insns, stack)
     else_block = None
+    #
+    # var = iterate over iterator => for loop
+    #
     if isinstance(statements[0], Assignment) and isinstance(statements[0].right, PythonIterate):
       if isinstance(statements[0].left, ExpressionList):
         var = statements[0].left.exprs
@@ -1323,21 +1332,36 @@ class PythonDecompiler:
       if isinstance(statements[-1], PythonBlockFinalizer):
         else_block = Else(statements.pop().statements)
       loop = For(var, expr, statements[1:])
+    #
+    # while loop
+    #
     else:
-      if len(statements) != 1 and not isinstance(statements[0], If):
-        raise Exception("Cannot decompile while loop.")
-      if_block = statements.pop(0)
-      if isinstance(if_block.statements[-1], PythonBlockFinalizer):
-        else_block = Else(if_block.statements.pop().statements)
-      loop = While(if_block.expr, if_block.statements)
-    
+      if len(statements) == 1 and isinstance(statements[0], If):
+        if_block = statements.pop(0)
+        if isinstance(if_block.statements[-1], PythonBlockFinalizer):
+          else_block = Else(if_block.statements.pop().statements)
+        loop = While(if_block.expr, if_block.statements)
+      else:
+        if isinstance(statements[-1], PythonBlockFinalizer):
+          else_block = Else(statements.pop().statements)
+        loop = While(Constant(True), statements)
+
+    # Remove extraneous continue statement
     if len(loop.statements) > 1 and isinstance(loop.statements[-1], Continue):
       loop.statements.pop()
 
-    loop = [ loop ]
+    loop_stmts = [ loop ]
     if else_block:
-      loop.append(else_block)
-    return (next_addr, loop)
+      loop_stmts.append(else_block)
+
+    # Escape while loop
+    if isinstance(loop, For) and next_addr is None:
+      print 'resuming at ' + str(self.__first_addr(insns))
+      next_addr = self.__first_addr(insns) # return to iterator
+    elif isinstance(loop, While) and next_addr is None or next_addr == self.__first_addr(insns):
+      next_addr = self.__last_addr(insns) # escape loop
+
+    return (next_addr, loop_stmts)
 
   def __decompile_with(self, expr, finally_addr, insns, stack):
     """ Decompile a with block.
@@ -1489,43 +1513,54 @@ class PythonDecompiler:
   def __factorize_condition(self, expr):
     """ Factorize a logical expression """
     ops = ( 'and', 'or' )
-    if isinstance(expr, BinaryOp) and expr.op in ops:
-      neg_op = ops[1-ops.index(expr.op)]
-      expr.left = self.__factorize_condition(expr.left)
-      expr.right = self.__factorize_condition(expr.right)
-      #
-      # (x < y) and (y < z) = x < y < z
-      #
-      #if expr.op == 'and' and isinstance(expr.left, BinaryOp) and isinstance(expr.right, BinaryOp) and expr.right.op in self.comparison_operators and expr.left.op in self.comparison_operators and expr.left.last == expr.right.first:
-      #  expr = BinaryOp(expr.left, expr.right.op, expr.right.right)
-      #  expr.left.parenthesize = expr.parenthesize = False
-      
-      #
-      # (x and y) or (z and y) = (x or z) and y
-      #
-      if isinstance(expr.left, BinaryOp) and isinstance(expr.right, BinaryOp) and expr.right.op == expr.left.op == neg_op and expr.left.right == expr.right.right:
-        expr = BinaryOp(BinaryOp(expr.left.left, expr.op, expr.right.left), neg_op, expr.right.right)
-      #
-      # (x and (y or z)) or z = (x and y) or z
-      #
-      if isinstance(expr.left, BinaryOp) and expr.left.op == neg_op and isinstance(expr.left.right, BinaryOp) and expr.left.right.op == expr.op and expr.left.right.right == expr.right:
-        expr = BinaryOp(BinaryOp(expr.left.left, neg_op, expr.left.right.left), expr.op, expr.right)
+    repass = True
+    while repass:
+      repass = False
+      if isinstance(expr, BinaryOp) and expr.op in ops:
+        neg_op = ops[1-ops.index(expr.op)]
+        expr.left = self.__factorize_condition(expr.left)
+        expr.right = self.__factorize_condition(expr.right)
+        #
+        # (x < y) and (y < z) = x < y < z
+        #
+        #if expr.op == 'and' and isinstance(expr.left, BinaryOp) and isinstance(expr.right, BinaryOp) and expr.right.op in self.comparison_operators and expr.left.op in self.comparison_operators and expr.left.last == expr.right.first:
+        #  expr = BinaryOp(expr.left, expr.right.op, expr.right.right)
+        #  expr.left.parenthesize = expr.parenthesize = False
+        
+        #
+        # (x and y) or (z and y) = (x or z) and y
+        #
+        if isinstance(expr.left, BinaryOp) and isinstance(expr.right, BinaryOp) and expr.right.op == expr.left.op == neg_op and expr.left.right == expr.right.right:
+          expr = BinaryOp(BinaryOp(expr.left.left, expr.op, expr.right.left), neg_op, expr.right.right)
+          repass = True
+          continue
+        #
+        # (x and (y or z)) or z = (x and y) or z
+        #
+        elif isinstance(expr.left, BinaryOp) and expr.left.op == neg_op and isinstance(expr.left.right, BinaryOp) and expr.left.right.op == expr.op and expr.left.right.right == expr.right:
+          expr = BinaryOp(BinaryOp(expr.left.left, neg_op, expr.left.right.left), expr.op, expr.right)
+          repass = True
+          continue
 
-    if isinstance(expr, UnaryOp) and expr.op == 'not ':
-      expr.expr = self.__factorize_condition(expr.expr)
-      #
-      # not (not x) = x
-      #
-      if isinstance(expr.expr, UnaryOp) and expr.expr.op == 'not ':
-        expr = expr.expr.expr
-      #
-      # not ((not x) and (not y)) = x or y
-      # not ((not x) or (not y)) = x and y
-      #
-      if isinstance(expr.expr, BinaryOp) and expr.expr.op in ops:
-        if isinstance(expr.expr.left, UnaryOp) and isinstance(expr.expr.right, UnaryOp):
-          if expr.expr.left.op == expr.expr.right.op == 'not ':
-            expr = BinaryOp(expr.expr.left, ops[1-ops.index(expr.expr.op)], expr.expr.right)
+      elif isinstance(expr, UnaryOp) and expr.op == 'not ':
+        expr.expr = self.__factorize_condition(expr.expr)
+        #
+        # not (not x) = x
+        #
+        if isinstance(expr.expr, UnaryOp) and expr.expr.op == 'not ':
+          expr = expr.expr.expr
+          repass = True
+          continue
+        #
+        # not ((not x) and (not y)) = x or y
+        # not ((not x) or (not y)) = x and y
+        #
+        elif isinstance(expr.expr, BinaryOp) and expr.expr.op in ops:
+          if isinstance(expr.expr.left, UnaryOp) and isinstance(expr.expr.right, UnaryOp):
+            if expr.expr.left.op == expr.expr.right.op == 'not ':
+              expr = BinaryOp(expr.expr.left, ops[1-ops.index(expr.expr.op)], expr.expr.right)
+              repass = True
+              continue
     return expr
 
   def __detect_end_of_statement(self, insns):
@@ -1546,9 +1581,11 @@ class PythonDecompiler:
     #else:
     #  print None
 
+    # Couldn't find a final block
     if not end_block:
+      # Check if one destination address resumes to start of loop (continue)
       for b in first_block.children:
-        if b.addr < self.__first_addr(insns):
+        if b.addr <= self.__first_addr(insns):
           end_addr = b.addr
           break
       else:
@@ -1556,11 +1593,14 @@ class PythonDecompiler:
     else:
       end_addr = end_block.addr
 
-    if end_addr < self.__first_addr(insns):
-      #last_addr = self.__next_addr(insns, blocks[sorted(blocks.keys())[-1]].end_addr)
+    if end_addr <= self.__first_addr(insns):
       last_addr = self.__last_addr(insns)  
     else:
       last_addr = end_addr
+
+    #print 'bounds : [' + str(insns[0][0]) + ', ' + str(insns[-1][0] + insns[-1][3]) + ']'
+    #print 'end_addr = ' + str(end_addr)
+    #print 'last_addr = ' + str(last_addr)
     return (end_addr, last_addr)
 
   # The horror show is about to begin
@@ -1806,7 +1846,7 @@ class PythonDecompiler:
       if opname in self.conditional_jump_insns:
         next_addr, cond_stmts = self.__decompile_condition(insns[n-1:], stack)
         statements.extend(cond_stmts)
-        if next_addr == None or next_addr < self.__first_addr(insns):
+        if next_addr is None or next_addr <= self.__first_addr(insns):
           return (next_addr, statements)
         n = self.__jmp_to_insn_at(insns, next_addr)
       elif opname[:7] == 'BINARY_':
@@ -1911,7 +1951,7 @@ class PythonDecompiler:
         return ( arg, statements )
       elif opname == 'DELETE_ATTR':
         base = stack.pop()
-        statements.append(Del(GetAttr(base, var)))
+        statements.append(Del(GetAttr(base, arg)))
       elif opname in ( 'DELETE_FAST', 'DELETE_NAME' ):
         statements.append(Del(Variable(arg)))
       elif opname == 'DELETE_GLOBAL':
@@ -1970,7 +2010,7 @@ class PythonDecompiler:
             comp = statements[-1].current 
             if isinstance(statements[-2], Assignment):
               assign = statements[-2]
-              if isinstance(assign.right, PythonIterate) and assign.right.iterator == iterator:
+              if isinstance(assign.right, PythonIterate) and assign.right.iterator is iterator:
                 iterable = iterator.expr
                 if isinstance(assign.left, ExpressionList):
                   var = assign.left.exprs
@@ -2012,9 +2052,10 @@ class PythonDecompiler:
           raise PythonDecompilerError("Unexpected jump address in bytecode.", addr, opname, arg)
         n = self.__jmp_to_insn_at(insns, arg)
       elif opname == 'JUMP_ABSOLUTE':
-        if arg < self.__first_addr(insns): # outer loop iteration
+        if arg <= self.__first_addr(insns): # outer loop iteration
           statements.append(Continue()) 
-          return (addr, statements)
+          # can't go any further in this block, let the caller decide where to resume
+          return (arg, statements) 
         else:
           jmp_n = self.__jmp_to_insn_at(insns, arg)
           n = jmp_n
@@ -2127,15 +2168,15 @@ class PythonDecompiler:
       elif opname in ('SETUP_EXCEPT', 'SETUP_FINALLY'):
         next_addr, try_stmts = self.__decompile_try_catch(insns[n-1:], stack)
         statements.extend(try_stmts)
-        if next_addr == None:
-          return (None, statements)
+        if next_addr is None or next_addr <= self.__first_addr(insns):
+          return (next_addr, statements)
         n = self.__jmp_to_insn_at(insns, next_addr)
       elif opname == 'SETUP_LOOP':
         endloop = self.__jmp_to_insn_at(insns, arg)
         next_addr, loop_stmts = self.__decompile_loop(insns[n:endloop], stack)
         statements.extend(loop_stmts)
-        if next_addr == None:
-          return (None, statements)
+        if next_addr is None or next_addr <= self.__first_addr(insns):
+          return (next_addr, statements)
         n = self.__jmp_to_insn_at(insns, next_addr)
       elif opname == 'SETUP_WITH':
         with_expr = stack.pop()
@@ -2144,8 +2185,8 @@ class PythonDecompiler:
         stack.append(PythonWithEnter(with_expr))
         next_addr, with_block = self.__decompile_with(with_expr, arg, insns[n:], stack)
         statements.append(with_block)
-        if next_addr == None:
-          return (None, statements)
+        if next_addr is None or next_addr <= self.__first_addr(insns):
+          return (next_addr, statements)
         n = self.__jmp_to_insn_at(insns, next_addr)
       elif opname == 'SLICE+0':
         stack.append(BinarySubscr(stack.pop(), Slice()))
@@ -2273,7 +2314,7 @@ class PythonDecompiler:
     if len(self.global_vars) > 0:
       start = isinstance(program.statements[0], DocString) and 1 or 0
       program.statements.insert(start, Global(ExpressionList(list(self.global_vars))))
-    return program.write(indent)
+    return program.write(indent) + "\n"
 
 def usage():
   print("Usage: %s [options] <pycfile>" % sys.argv[0])
