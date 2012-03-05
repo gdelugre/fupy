@@ -480,7 +480,7 @@ class Lambda(Expression):
       if isinstance(statement, Return):
         self.statements[i] = statement.expr
       elif isinstance(statement, Block):
-        statement.replace_statements(match = (lambda s: ininstance(s, Return)), new = (lambda s: s.expr), rec = True)
+        statement.replace_statements(match = (lambda s: isinstance(s, Return)), new = (lambda s: s.expr), rec = True)
 
   @Statement.auto_indent
   def write(self, indent = ''):
@@ -806,10 +806,7 @@ class Return(Statement):
   """ return statement. """
   def __init__(self, expr = None):
     Statement.__init__(self)
-    if isinstance(expr, Constant) and expr.value is None:
-      self.expr = None
-    else:
-      self.expr = expr
+    self.expr = expr
 
   @Statement.auto_indent
   def write(self, indent = ''):
@@ -1190,9 +1187,7 @@ class PythonDecompiler:
     'JUMP_IF_TRUE_OR_POP', 
     'JUMP_IF_FALSE_OR_POP',
     
-    'FOR_ITER',       # finally clause
     'SETUP_FINALLY',  # finally clause
-    'SETUP_WITH',     # finally clause
     'SETUP_EXCEPT',   # except clause
   )
 
@@ -1313,9 +1308,9 @@ class PythonDecompiler:
     Return a list of Statements.
     """
     #if __debug__:
-    #  print 'Disassembling %s:' % code.co_name
-    #  dis.dis(code)
-    #  print '_' * 80
+      #print 'Disassembling %s:' % code.co_name
+      #dis.dis(code)
+      #print '_' * 80
     insns = self.__disassemble(code)
     return self.__decompile_block(insns, [])[1]
 
@@ -1410,7 +1405,7 @@ class PythonDecompiler:
         block.add_child(blocks[addr])
         break
       elif opname == 'RETURN_VALUE':
-        break
+        break  
       elif opname in self.jump_insns or i == len(insns) - 1:
         if opname in self.jump_insns:
           if opname in self.conditional_insns:
@@ -1661,12 +1656,6 @@ class PythonDecompiler:
 
     # Conditional execution paths must set the stack in a consistent state at return.
     # Something wrong happened if this property is not satisfied.
-    if len(if_stack) != len(else_stack):
-      print if_addr
-      print len(if_stack)
-      print else_addr
-      print len(else_stack)
-      print else_stack[-1]
     assert(len(if_stack) == len(else_stack))
 
     # Empty statements ? Check the stack for remaining values.
