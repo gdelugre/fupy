@@ -2281,20 +2281,22 @@ def usage():
   print(" -h, --help:               Display this message.")
   print("--disass:                  Disassemble bytecode only.")
   print("-i style, --indent=style   Set indentation style (default to 4s).")
-  print("                           style is [num]char where char is 's' for spaces or 't' for tabs.")
+  print("                            style is [num]char where char is 's' for spaces or 't' for tabs.")
+  print("-o file, --output=file     Redirect output to file (default to stdout).")
 
 if __name__ == "__main__":
   import getopt
   import re
 
   try:
-    opts, args = getopt.getopt(sys.argv[1:], "hi:", ["help", "disass", "indent="])
+    opts, args = getopt.getopt(sys.argv[1:], "hi:o:", ["help", "disass", "indent=", "output="])
   except getopt.GetoptError:
     usage()
     exit(1)
   
   indent_pattern = ' ' * 4
   disassemble = False
+  output = sys.stdout
   for opt, arg in opts:
     if opt in ("-h", "--help"):
       usage()
@@ -2309,6 +2311,12 @@ if __name__ == "__main__":
       indent_num = int(len(m.group(1)) > 0 and m.group(1) or "1")
       indent_char = {"s":" ", "t": "\t"}[m.group(2)]
       indent_pattern = indent_num * indent_char
+    elif opt in ("-o", "--output"):
+      try:
+        output = open(arg, "w")  
+      except IOError:
+        print("Error: cannot open '%s' for writing" % arg)
+        exit(1)
 
   if len(args) != 1:
     usage()
@@ -2318,9 +2326,12 @@ if __name__ == "__main__":
   try:
     pydec = PythonDecompiler(target)
     if disassemble:
-      print(pydec.disassemble())
+      dump = pydec.disassemble()
     else:
-      print(pydec.decompile(indent = indent_pattern))
+      dump = pydec.decompile(indent = indent_pattern)
+    output.write(dump)
   except PythonDecompilerError as e:
     print("Error: " + str(e))
+  finally:
+    output.close()
 
