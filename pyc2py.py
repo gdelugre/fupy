@@ -2278,11 +2278,11 @@ class PythonDecompiler:
 def usage():
   print("Usage: %s [options] <pycfile>" % sys.argv[0])
   print("Reverse a Python pyc file back into a human readable form.")
-  print(" -h, --help:               Display this message.")
-  print("--disass:                  Disassemble bytecode only.")
-  print("-i style, --indent=style   Set indentation style (default to 4s).")
+  print(" -h, --help                Display this message.")
+  print(" --disass                  Disassemble bytecode only.")
+  print(" -i style, --indent=style  Set indentation style (default to 4s).")
   print("                            style is [num]char where char is 's' for spaces or 't' for tabs.")
-  print("-o file, --output=file     Redirect output to file (default to stdout).")
+  print(" -o file, --output=file    Redirect output to file (default to stdout).")
 
 if __name__ == "__main__":
   import getopt
