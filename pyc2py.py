@@ -125,6 +125,8 @@ class Block(Statement):
 
 class Expression(Statement):
   """ Python generic expression. """
+  def __hash__(self):
+    return hash(id(self))
 
 class ExpressionList(Expression):
   """ List of expressions : expr1, expr2, ... """
