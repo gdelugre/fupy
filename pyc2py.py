@@ -981,14 +981,16 @@ class PythonIterator:
   def __init__(self, expr):
     self.expr = expr
     self.walked = False
+    self.alive = True
     self.exhausted_addr = None
 
 class PythonIterate:
   """
   Internally used by the decompiler to mark a next() call on a volatile iterator.
   """
-  def __init__(self, iterator):
+  def __init__(self, iterator, addr):
     self.iterator = iterator
+    self.addr = addr
 
 class PythonOpenedComprehension(Statement):
   """
@@ -1060,6 +1062,9 @@ class PythonUnpackedSequence:
     self.expr = expr
     self.size = size
     self.variables = [ None ] * size
+    self.nested = False
+    self.parent = None
+    self.parent_index = None
 
   def bind(self, index, var):
     self.variables[index] = var
@@ -1307,10 +1312,10 @@ class PythonDecompiler:
     """ Decompile a code object.
     Return a list of Statements.
     """
-    if __debug__:
-      print 'Disassembling %s:' % code.co_name
-      dis.dis(code)
-      print '_' * 80
+    #if __debug__:
+    #  print 'Disassembling %s:' % code.co_name
+    #  dis.dis(code)
+    #  print '_' * 80
     insns = self.__disassemble(code)
     return self.__decompile_block(insns, [])[1]
 
@@ -1324,11 +1329,13 @@ class PythonDecompiler:
     # var = iterate over iterator => for loop
     #
     if isinstance(statements[0], Assignment) and isinstance(statements[0].right, PythonIterate):
+      iterate = statements[0].right
+      iterator = iterate.iterator
       if isinstance(statements[0].left, ExpressionList):
         var = statements[0].left.exprs
       else:
         var = [ statements[0].left ]
-      expr = statements[0].right.iterator.expr
+      expr = iterator.expr
       if isinstance(statements[-1], PythonBlockFinalizer):
         else_block = Else(statements.pop().statements)
       loop = For(var, expr, statements[1:])
@@ -1350,16 +1357,19 @@ class PythonDecompiler:
     if len(loop.statements) > 1 and isinstance(loop.statements[-1], Continue):
       loop.statements.pop()
 
+    # Reached end of for loop before cleaning the block (e.g. because of a return statement)
+    if isinstance(loop, For) and iterator.alive:
+      # Finalize the block, cleanup the stack
+      next_addr, finalize_stmts = self.__decompile_block(insns[self.__jmp_to_insn_at(insns, iterate.addr):], stack)
+      if len(finalize_stmts) > 0 and isinstance(finalize_stmts[-1], PythonBlockFinalizer):
+        else_block = Else(finalize_stmts.pop().statements)
+    # Escape while loop
+    elif isinstance(loop, While) and next_addr is None or next_addr == self.__first_addr(insns):
+      next_addr = self.__last_addr(insns) # escape loop
+
     loop_stmts = [ loop ]
     if else_block:
       loop_stmts.append(else_block)
-
-    # Escape while loop
-    if isinstance(loop, For) and next_addr is None:
-      print 'resuming at ' + str(self.__first_addr(insns))
-      next_addr = self.__first_addr(insns) # return to iterator
-    elif isinstance(loop, While) and next_addr is None or next_addr == self.__first_addr(insns):
-      next_addr = self.__last_addr(insns) # escape loop
 
     return (next_addr, loop_stmts)
 
@@ -1651,6 +1661,12 @@ class PythonDecompiler:
 
     # Conditional execution paths must set the stack in a consistent state at return.
     # Something wrong happened if this property is not satisfied.
+    if len(if_stack) != len(else_stack):
+      print if_addr
+      print len(if_stack)
+      print else_addr
+      print len(else_stack)
+      print else_stack[-1]
     assert(len(if_stack) == len(else_stack))
 
     # Empty statements ? Check the stack for remaining values.
@@ -1765,7 +1781,7 @@ class PythonDecompiler:
 
       multiple_excepts = False
       for statement in except_stmts:
-        if isinstance(statement, If) or isinstance(statement, Elif) and isinstance(statement.expr, BinaryOp) and statement.expr.op == 'exception match':
+        if (isinstance(statement, If) or isinstance(statement, Elif)) and isinstance(statement.expr, BinaryOp) and statement.expr.op == 'exception match':
           multiple_excepts = True
           exc_var = None
           if len(statement.statements) > 0 and isinstance(statement.statements[0], Assignment) and isinstance(statement.statements[0].right, PythonExceptionInstance):
@@ -1996,10 +2012,12 @@ class PythonDecompiler:
           stack[-1] = iterator = PythonIterator(iterator) # cast variable to iterator
         if not iterator.walked:
           iterator.walked = True
+          iterator.alive = True
           iterator.exhausted_addr = arg
-          stack.append(PythonIterate(iterator))
+          stack.append(PythonIterate(iterator, addr))
         else:
           iterator = stack.pop() # remove the iterator from the stack
+          iterator.alive = False
           if_expr = None
           if len(statements) > 0 and isinstance(statements[-1], If):
             if len(statements[-1].statements) > 0 and isinstance(statements[-1].statements[0], PythonOpenedComprehension):
@@ -2279,9 +2297,14 @@ class PythonDecompiler:
           else:
             statements.append(ImportFrom(value.module, value.name))
         elif isinstance(value, PythonUnpackedValue):
-          value.sequence.bind(value.index, target)
-          if value.sequence.is_complete():
-            statements.append(Assignment(ExpressionList(value.sequence.variables), value.sequence.expr))
+          seq = value.sequence
+          seq.bind(value.index, target)
+          while seq.nested:
+            if seq.is_complete():
+              seq.parent.bind(seq.parent_index, Constant(tuple(seq.variables)))
+            seq = seq.parent
+          if seq.is_complete():
+            statements.append(Assignment(ExpressionList(seq.variables), seq.expr))
         else:
           statements.append(Assignment(target, value))
       elif opname[:6] == 'UNARY_':
@@ -2292,7 +2315,12 @@ class PythonDecompiler:
         else:
           raise PythonDecompilerError("Unhandled opcode", addr, opname, arg)
       elif opname == 'UNPACK_SEQUENCE':
-        sequence = PythonUnpackedSequence(stack.pop(), arg)
+        packed_expr = stack.pop()
+        sequence = PythonUnpackedSequence(packed_expr, arg)
+        if isinstance(packed_expr, PythonUnpackedValue):
+          sequence.nested = True
+          sequence.parent = packed_expr.sequence
+          sequence.parent_index = packed_expr.index
         for i in range(0, arg):
           stack.append(PythonUnpackedValue(sequence, arg - i - 1))
       elif opname == 'WITH_CLEANUP':
