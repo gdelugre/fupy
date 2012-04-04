@@ -1417,7 +1417,7 @@ class PythonDecompiler:
       if i > 0 and addr in blocks: # break if we enter existing block
         block.add_child(blocks[addr])
         break
-      elif opname == 'RETURN_VALUE':
+      elif opname == 'RETURN_VALUE' or opname == 'RAISE_VARARGS':
         break  
       elif opname in self.jump_insns or i == len(insns) - 1:
         if opname in self.jump_insns:
@@ -1831,6 +1831,16 @@ class PythonDecompiler:
         if isinstance(statement, Yield):
           first.expr = statement.expr
           return current
+        elif isinstance(statement, For): # < 2.7
+          iterable = statement.expr
+          var = statement.variables
+          if not current.variables:
+            current.variables = var
+            if not isinstance(iterable, Variable):
+              current.iterable = iterable
+          else:
+            current = Comprehension(current, var, iterable)
+          return create_generator_from_statements(first, statement.statements, current)
         elif isinstance(statement, Assignment) and isinstance(statement.right, PythonIterate):
           iterable = statement.right.iterator.expr
           if isinstance(statement.left, ExpressionList):
@@ -2084,8 +2094,9 @@ class PythonDecompiler:
           n = jmp_n
       elif opname == 'LIST_APPEND':
         expr = stack.pop()
-        stack[-arg] = ListComprehension(Comprehension(expr, None, None))
-        statements.append(PythonOpenedComprehension(stack[-arg]))
+        list_pos = arg or -1 # 2.7 can specify pos in argument
+        stack[-list_pos] = ListComprehension(Comprehension(expr, None, None))
+        statements.append(PythonOpenedComprehension(stack[-list_pos]))
       elif opname == 'LOAD_ATTR':
         stack.append(GetAttr(stack.pop(), arg))
       elif opname == 'LOAD_CONST':
@@ -2172,6 +2183,7 @@ class PythonDecompiler:
         else:
           raise PythonDecompilerError("Bad number of arguments", addr, opname, arg)
         statements.append(Raise(exception, param, trace))
+        return (None, statements)
       elif opname == 'RETURN_VALUE':
         statements.append(Return(stack.pop()))
         return (None, statements) # next instruction unreachable
