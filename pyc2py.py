@@ -1099,6 +1099,13 @@ class PythonCompiledObjectFile:
   """
   Helper class for opening Python compiled object files (.pyc or .pyo)
   """
+  
+  version_by_magic = {
+    '\xb3\xf2\r\n' : 2.5,
+    '\xd1\xf2\r\n' : 2.6,
+    '\x03\xf3\r\n' : 2.7
+  }
+  
   def __init__(self, path):
     fp = open(path, 'rb')
 
@@ -1114,6 +1121,9 @@ class PythonCompiledObjectFile:
 
     finally:
       fp.close()
+      
+  def python_version(self):
+    return self.version_by_magic[self.magic]
 
 class PythonDecompilerError(Exception):
   def __init__(self, message, addr = None, opname = None, arg = None):
@@ -1235,6 +1245,7 @@ class PythonDecompiler:
 
   def __init__(self, path):
     self.pyc = PythonCompiledObjectFile(path)
+    self.target_version = self.pyc.python_version()
     self.global_vars = set()
 
   def __disassemble_insn_at(self, bytecode, i):
@@ -1700,6 +1711,14 @@ class PythonDecompiler:
     stack[:] = if_stack
     if logical_expr:
       return (end_addr, [])
+    
+    # Python < 2.7 does not have POP_* instructions.
+    # Stack cleaning inside condition blocks can create dummy statements if the expression is a function call.
+    if self.target_version < 2.7:
+      while len(if_stmt.statements) > 0 and if_stmt.statements[0] == if_stmt.expr:
+        if_stmt.statements.pop(0)
+      while len(else_stmt.statements) > 0 and else_stmt.statements[0] == if_stmt.expr:
+        else_stmt.statements.pop(0)
     
     """
     if expr1: pass
