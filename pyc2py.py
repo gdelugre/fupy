@@ -115,10 +115,29 @@ class Block(Statement):
       self.append_statement(Pass())
 
   def write(self, indent = ''):
-    self.replace_statements(
-      match = lambda s: isinstance(s, If) and len(s.statements) == 1 and isinstance(s.statements[0], Raise) and s.statements[0].exception == Variable('AssertionError'),
-      new = lambda s: Assert(s.expr.expr if isinstance(s.expr, UnaryOp) and s.expr.op == 'not ' else UnaryOp('not ', s.expr), s.statements[0].param)
-    )
+    # Reduce conditional blocks to assert statements when possible
+    i = 0
+    while i < len(self.statements):
+      s = self.statements[i]
+      next = i < len(self.statements) - 1 and self.statements[i + 1]
+      if isinstance(s, If) and not isinstance(next, Elif):
+        if len(s.statements) == 1 and isinstance(s.statements[0], Raise) and s.statements[0].exception == Variable('AssertionError'):
+          self.statements[i] = Assert(s.expr.expr if isinstance(s.expr, UnaryOp) and s.expr.op == 'not ' else UnaryOp('not ', s.expr), s.statements[0].param)
+          self.statements[i].set_indent_level(self.indent_level + 1)
+          if isinstance(next, Else):
+            self.statements.pop(i + 1)
+            self.statements[i+1:i+2] = next.statements
+            for statement in next.statements:
+              statement.set_indent_level(self.indent_level + 1)
+        elif isinstance(next, Else) and len(next.statements) == 1 and isinstance(next.statements[0], Raise) and next.statements[0].exception == Variable('AssertionError'):
+          self.statements[i] = Assert(s.expr, next.statements[0].param)
+          self.statements[i].set_indent_level(self.indent_level + 1)
+          self.statements.pop(i + 1)
+          self.statements[i+1:i+2] = s.statements
+          for statement in s.statements:
+            statement.set_indent_level(self.indent_level + 1)
+      i = i + 1
+      
     if len(self.statements) == 0:
       self.append_statement(Pass())
     return "\n".join([statement.write(indent) for statement in self.statements])
