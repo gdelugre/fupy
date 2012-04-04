@@ -672,6 +672,8 @@ class FunctionDefinition(Block):
     self.varargs = varargs
     self.kwvarargs = kwvarargs
     self.docstring = None
+    if len(statements) > 0 and statements[-1].write('') == 'return':
+      statements.pop()
 
   def set_docstring(self, string):
     self.docstring = DocString(string)
@@ -813,7 +815,7 @@ class Return(Statement):
   @Statement.auto_indent
   def write(self, indent = ''):
     out = "return"
-    if self.expr != None:
+    if self.expr != None and self.expr != Constant(None):
       out += " " + self.expr.write()
     return out
 
@@ -1180,7 +1182,9 @@ class PythonDecompiler:
     'POP_JUMP_IF_TRUE', 
     'POP_JUMP_IF_FALSE', 
     'JUMP_IF_TRUE_OR_POP', 
-    'JUMP_IF_FALSE_OR_POP' 
+    'JUMP_IF_FALSE_OR_POP',
+    'JUMP_IF_TRUE',   # < 2.7
+    'JUMP_IF_FALSE'   # < 2.7
   )
   
   conditional_insns = ( 
@@ -1188,6 +1192,8 @@ class PythonDecompiler:
     'POP_JUMP_IF_FALSE', 
     'JUMP_IF_TRUE_OR_POP', 
     'JUMP_IF_FALSE_OR_POP',
+    'JUMP_IF_TRUE',   # < 2.7
+    'JUMP_IF_FALSE',  # < 2.7
     
     'SETUP_FINALLY',  # finally clause
     'SETUP_EXCEPT',   # except clause
@@ -1198,6 +1204,8 @@ class PythonDecompiler:
     'POP_JUMP_IF_FALSE', 
     'JUMP_IF_TRUE_OR_POP', 
     'JUMP_IF_FALSE_OR_POP',
+    'JUMP_IF_TRUE',   # < 2.7
+    'JUMP_IF_FALSE',  # < 2.7
     'JUMP_FORWARD',
     'JUMP_ABSOLUTE',
     'CONTINUE_LOOP',
@@ -1206,6 +1214,7 @@ class PythonDecompiler:
     'SETUP_FINALLY',  # finally clause
     'SETUP_WITH',     # finally clause
     'SETUP_EXCEPT',   # except clause
+    'SETUP_LOOP'
   )
 
   CODE_FLAG_OPTIMIZED = 1
@@ -1322,6 +1331,8 @@ class PythonDecompiler:
     """
     next_addr, statements = self.__decompile_block(insns, stack)
     else_block = None
+    assert(len(statements) > 0)
+
     #
     # var = iterate over iterator => for loop
     #
@@ -1448,7 +1459,7 @@ class PythonDecompiler:
     return block
 
   def __find_convergent_block(self, src_blocks, blocks, walked):
-    """ Recursively find first basic block from blocks which has src_blocks as ancestors
+    """ Recursively find first basic block reachable by all paths from src_blocks
         and for which a parent has exactly one children.
         This basic block is characteristic of the end of a conditional statement.
 
@@ -1464,12 +1475,13 @@ class PythonDecompiler:
       #print [ p.addr for p in block.parents ]
       if any(len(p.children) == 1 for p in block.parents):
         for src_block in src_blocks:
-          if src_block not in (block.get_ancestors() | set([block])):
+          if not walked.issubset(block.get_ancestors()):
             break
         else:
           return block
 
     walked |= blocks
+    # set of all children of current blocks, minus already walked blocks
     children = reduce(lambda c1, c2: c1 | c2, [ b.children for b in blocks ]) - walked
     return self.__find_convergent_block(src_blocks, children, walked)
 
@@ -1635,11 +1647,13 @@ class PythonDecompiler:
       if opname[5:13] == 'IF_FALSE':
         if_addr = addr + opsize
         else_addr = target
-        if_stack.pop() # OR_POP
+        if opname[-6:] == 'OR_POP':
+          if_stack.pop() # OR_POP
       else:
         if_addr = target
         else_addr = addr + opsize
-        else_stack.pop() # OR_POP
+        if opname[-6:] == 'OR_POP':
+          else_stack.pop() # OR_POP
 
     try:
       if_insns = insns[self.__jmp_to_insn_at(insns, if_addr):self.__jmp_to_insn_at(insns, last_addr)]
