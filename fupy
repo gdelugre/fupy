@@ -738,7 +738,7 @@ class Import(Statement):
 
   @Statement.auto_indent
   def write(self, indent = ''):
-    out = "import " + self.module.write()
+    out = "import " + '.'.join(self.module.path)
     if self.as_name:
       out += " as " + self.as_name.write()
     return out
@@ -756,7 +756,7 @@ class ImportFrom(Statement):
 
   @Statement.auto_indent
   def write(self, indent = ''):
-    out = "from " + self.module.write() + " import " + self.name.write()
+    out = "from " + '.'.join(self.module.path) + " import " + self.name.write()
     if self.as_name:
       out += " as " + self.as_name.write()
     return out
@@ -942,14 +942,14 @@ class PythonExceptionInstance:
   def write(self, indent = ''):
     return '.CurrentException'
  
-class PythonCompiledModule:
+class PythonImportedModule:
   """
   Internally used by the decompiler to represent an imported module.
   """
-  def __init__(self, module):
-    self.module = module
+  def __init__(self, name):
+    self.path = name.split('.')
 
-class PythonCompiledModuleAttr:
+class PythonImportedModuleAttr:
   """
   Internally used by the decompiler to represent an imported module name.
   """
@@ -2103,17 +2103,20 @@ class PythonDecompiler:
       elif opname == 'GET_ITER':
         stack.append(PythonIterator(stack.pop()))
       elif opname == 'IMPORT_FROM':
-        if len(stack) == 0 or not isinstance(stack[-1], PythonCompiledModule):  
+        if len(stack) == 0 or not isinstance(stack[-1], PythonImportedModule):  
           raise PythonDecompilerError("Expected module on the stack.", addr, opname, arg)
-        stack.append(PythonCompiledModuleAttr(stack[-1].module, Variable(arg)))
+        stack.append(PythonImportedModuleAttr(stack[-1], Variable(arg)))
       elif opname == 'IMPORT_NAME':
         fromlist = stack.pop()
         level = stack.pop()
-        stack.append(PythonCompiledModule(Variable(arg)))
+        if fromlist.value is None or isinstance(fromlist.value, list) and len(fromlist.value) == 0:
+          stack.append(PythonImportedModule(arg.split('.')[0]))
+        else:
+          stack.append(PythonImportedModule(arg))
       elif opname == 'IMPORT_STAR':
-        if len(stack) == 0 or not isinstance(stack[-1], PythonCompiledModule):  
+        if len(stack) == 0 or not isinstance(stack[-1], PythonImportedModule):  
           raise PythonDecompilerError("Expected module on the stack.", addr, opname, arg)
-        statements.append(ImportFrom(stack.pop().module, Variable('*')))
+        statements.append(ImportFrom(stack.pop(), Variable('*')))
       elif opname[:8] == 'INPLACE_':
         right = stack.pop()
         left = stack.pop()
@@ -2136,7 +2139,15 @@ class PythonDecompiler:
         stack[-list_pos] = ListComprehension(Comprehension(expr, None, None))
         statements.append(PythonOpenedComprehension(stack[-list_pos]))
       elif opname == 'LOAD_ATTR':
-        stack.append(GetAttr(stack.pop(), arg))
+        base = stack.pop()
+        if isinstance(base, PythonImportedModule):
+          stack.append(PythonImportedModuleAttr(base, Variable(arg)))
+        elif isinstance(base, PythonImportedModuleAttr):
+          base.module.path.append(base.name.name)
+          base.name = Variable(arg)
+          stack.append(base)
+        else:
+          stack.append(GetAttr(base, arg))
       elif opname == 'LOAD_CONST':
         stack.append(Constant(arg))
       elif opname == 'LOAD_GLOBAL':
@@ -2341,12 +2352,12 @@ class PythonDecompiler:
           classo = value
           name = arg
           statements.append(ClassDefinition(name, classo.supers, self.__decompile(classo.code)))
-        elif isinstance(value, PythonCompiledModule):
-          if target != value.module:
-            statements.append(Import(value.module, as_name = target))
+        elif isinstance(value, PythonImportedModule):
+          if target.name != value.path[-1]:
+            statements.append(Import(value, as_name = target))
           else:
-            statements.append(Import(value.module))
-        elif isinstance(value, PythonCompiledModuleAttr):
+            statements.append(Import(value))
+        elif isinstance(value, PythonImportedModuleAttr):
           if target != value.name:
             statements.append(ImportFrom(value.module, value.name, as_name = target))
           else:
